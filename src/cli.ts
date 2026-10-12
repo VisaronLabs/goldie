@@ -2,12 +2,16 @@
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { capture } from "./capture.ts";
+import { capture, captureLocales } from "./capture.ts";
 import {
   applyDesign,
+  FRAME_VARIANTS,
   type FrameVariant,
+  isFrameVariant,
   type LoadedConfig,
   loadConfig,
+  selectLocales,
+  VARIANT_DEVICE,
   validateLayouts,
 } from "./config.ts";
 import * as device from "./device.ts";
@@ -17,7 +21,7 @@ import { LAYOUT_KEYS, type LayoutKey, TEMPLATE_KEYS } from "./layouts.ts";
 import { writeManifest } from "./manifest.ts";
 import { renderPreview, renderScreenshots, verify } from "./render.ts";
 import { FlowFailure, repairBrief } from "./repair.ts";
-import type { DeviceKey } from "./specs.ts";
+import { DEVICE_KEYS, type DeviceKey, isDeviceKey } from "./specs.ts";
 import { openInBrowser, serveStudio, studioPaths } from "./studio-server.ts";
 
 const USAGE = `
@@ -26,8 +30,8 @@ goldie - App Store screenshots and previews, driven by argent
   goldie doctor     Check the toolchain, simulators, flags and flows
   goldie capture    Replay every scene flow and save raw captures
   goldie frame      Composite raw screenshots into framed, captioned PNGs
-  goldie preview    Join the raw clips into the app preview video
-  goldie verify     Check finished assets against Apple's spec table
+  goldie preview    Join the raw clips into the preview video (App Store upload; YouTube for Play)
+  goldie verify     Check finished assets against the store spec tables
   goldie manifest   Write out/store.json for the studio app
   goldie studio     Serve the studio at http://localhost:4321 (--port <n>, --no-open)
   goldie all        capture -> frame -> preview -> manifest -> verify
@@ -35,11 +39,11 @@ goldie - App Store screenshots and previews, driven by argent
 
 Options
   --config <path>   Config file (default ./goldie.config.ts)
-  --device <key>    Only this device key (default: every device in the config)
+  --device <key>    Only this device key (${DEVICE_KEYS.join(" | ")}; default: every device in the config)
   --locale <code>   Only this locale (default: every locale in the config)
   --background <css>  Override theme.background for this run (also clears per-scene backgrounds); "transparent" keeps alpha
-  --frame <variant>   Override the screenshot bezel variant for this run (17-pro-silver | 17-pro-blue | 17-pro-orange)
-  --font <key>        Override theme.fontFamily for this run (system | ${FONT_KEYS.join(" | ")})
+  --frame <variant>   Override the bezel variant of its device for this run, repeatable (${FRAME_VARIANTS.join(" | ")})
+  --font <key>        Override theme.fontFamily for this run (system | ${FONT_KEYS.join(" | ")} | a theme.fontFiles family)
   --template <key>    Override theme.template for this run (${TEMPLATE_KEYS.join(" | ")}; "none" for one layout)
   --layout <key>      Override theme.layout for this run (${LAYOUT_KEYS.join(" | ")})
   --screen-only       Render bare screens with no bezel for this run
@@ -68,25 +72,40 @@ async function main() {
   // One-run overrides on top of the config and goldie.design.json (the
   // studio's saved choices). Copy a value into the config to keep it.
   const font = opt("font");
+  const frames: Partial<Record<DeviceKey, FrameVariant>> = {};
+  argv.forEach((arg, i) => {
+    const variant = argv[i + 1];
+    if (arg !== "--frame" || variant === undefined) return;
+    if (!isFrameVariant(variant)) {
+      throw new Error(
+        `Unknown frame variant "${variant}". Available: ${FRAME_VARIANTS.join(", ")}`,
+      );
+    }
+    frames[VARIANT_DEVICE[variant]] = variant;
+  });
   applyDesign(cfg, {
     background: opt("background"),
-    frame: opt("frame") as FrameVariant | undefined,
-    fontFamily: font ? fontStack(font) : undefined, // throws on an unknown key
+    frames,
+    fontFamily: font ? fontStack(font, cfg.theme.fontFiles) : undefined, // throws on an unknown key
     template: opt("template") === "none" ? "" : opt("template"),
     layout: opt("layout") as LayoutKey | undefined,
     screenOnly: argv.includes("--screen-only") ? true : undefined,
   });
   validateLayouts(cfg);
 
-  const devices = (opt("device") ? [opt("device") as DeviceKey] : cfg.devices) as DeviceKey[];
-  const locales = opt("locale") ? [opt("locale")!] : cfg.locales;
+  const only = opt("device");
+  if (only !== undefined && !isDeviceKey(only)) {
+    throw new Error(`Unknown device "${only}". Available: ${DEVICE_KEYS.join(", ")}`);
+  }
+  const devices = only ? [only] : cfg.devices;
+  const locales = selectLocales(cfg.locales, opt("locale"));
 
   switch (command) {
     case "doctor":
       return (await doctor(cfg)) ? 0 : 1;
 
     case "capture":
-      await runCapture(cfg, devices);
+      await runCapture(cfg, devices, locales);
       return 0;
 
     case "frame":
@@ -120,7 +139,7 @@ async function main() {
 
     case "all": {
       if (!(await doctor(cfg))) return 1;
-      await runCapture(cfg, devices);
+      await runCapture(cfg, devices, locales);
       for (const d of devices) {
         for (const l of locales) {
           await renderScreenshots(cfg, d, l);
@@ -145,14 +164,14 @@ function packageVersion(): string {
   return JSON.parse(readFileSync(pkg, "utf8")).version;
 }
 
-async function runCapture(cfg: LoadedConfig, devices: DeviceKey[]) {
+async function runCapture(cfg: LoadedConfig, devices: DeviceKey[], locales: string[]) {
   for (const d of devices) {
     const udid = await device.resolveUdid(d);
     try {
-      await capture(cfg, d);
+      for (const locale of captureLocales(cfg, d, locales)) await capture(cfg, d, locale);
     } finally {
-      // Leave the simulator as it was found; a pinned status bar is sticky.
-      await device.clearStatusBar(udid);
+      // Leave the device as it was found; a pinned status bar is sticky.
+      await device.clearStatusBar(d, udid);
     }
   }
 }

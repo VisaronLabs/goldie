@@ -1,20 +1,36 @@
-import { copyFile, mkdir, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve } from "node:path";
-import type { CaptureManifest } from "./capture.ts";
+import {
+  copyFile,
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
+import { type CaptureManifest, capturesPerLocale, rawDirFor } from "./capture.ts";
 import {
   type Decoration,
+  deviceFrame,
   FRAME_VARIANTS,
   framePath,
+  frameVariantFor,
   isPreview,
   isScreenshot,
   type LoadedConfig,
   type Theme,
+  VARIANT_DEVICE,
   variantFramePath,
 } from "./config.ts";
 import { execOrThrow } from "./exec.ts";
-import { FONTS, fontFilePath } from "./fonts.ts";
+import { CUSTOM_FONT_FALLBACK, FONTS, fontFilePath } from "./fonts.ts";
+import type { FrameGeometry } from "./frame.ts";
+import { imageSize } from "./image.ts";
 import { LAYOUTS, TEMPLATES } from "./layouts.ts";
-import { DEVICES, type DeviceKey } from "./specs.ts";
+import { DEVICES, type DeviceKey, type DeviceType } from "./specs.ts";
 
 /**
  * `out/web/` - the studio's static root. It holds the manifest, the
@@ -43,9 +59,18 @@ export type StoreManifest = {
   devices: Array<{
     key: DeviceKey;
     label: string;
-    simulatorName: string;
+    platform: "ios" | "android";
+    type: DeviceType;
+    copyScale: number;
+    simulatorName: string | null;
     screenshot: { width: number; height: number };
-    preview: { width: number; height: number };
+    preview: { width: number; height: number } | null;
+    /**
+     * Bezel art fixed to this device (the android Pixel art), with the
+     * geometry it composes at. null on devices that render the frame variant
+     * the design picks.
+     */
+    frame: { url: string; geom: FrameGeometry } | null;
   }>;
   locales: string[];
   /** Keyed by device key, then locale. */
@@ -53,10 +78,11 @@ export type StoreManifest = {
   /** Everything the studio needs to composite scenes in the browser. */
   design: {
     theme: Theme;
-    /** null when the config points at custom bezel art. */
-    frameVariant: string | null;
-    frameVariants: string[];
-    /** Url of the config's custom bezel art; null when a bundled variant is used. */
+    /** The bundled variant each device renders with; null when the config points at custom bezel art. */
+    frames: Record<string, string | null>;
+    /** Every bundled variant and the device it is drawn for. */
+    frameVariants: Array<{ key: string; device: string }>;
+    /** Url of the config's custom bezel art; null when bundled variants are used. */
     customFrameUrl: string | null;
     /** Bundled typefaces, with the @font-face sources the studio declares. */
     fonts: Array<{
@@ -88,14 +114,17 @@ export type StoreManifest = {
       segments: Array<{ id: string }>;
     } | null;
     /** Raw capture urls per device key; a device is absent until `goldie capture` ran. */
-    captures: Record<
-      string,
-      {
-        screenshots: Array<{ sceneId: string; url: string }>;
-        clips: Array<{ segmentId: string; url: string; durationSeconds: number }> | null;
-      }
-    >;
+    captures: Record<string, DeviceCaptureUrls & { byLocale?: Record<string, DeviceCaptureUrls> }>;
   };
+};
+
+/**
+ * A device's raw capture urls. With localizedCaptures, `byLocale` holds each
+ * captured locale's own set and the top level repeats the first locale's.
+ */
+export type DeviceCaptureUrls = {
+  screenshots: Array<{ sceneId: string; url: string }>;
+  clips: Array<{ segmentId: string; url: string; durationSeconds: number }> | null;
 };
 
 export type LocaleAssets = {
@@ -129,11 +158,26 @@ export async function writeManifest(cfg: LoadedConfig): Promise<string> {
   // frames never waits on a server.
   const framesDir = join(webDir, "frames");
   await mkdir(framesDir, { recursive: true });
+  const frameVariants: StoreManifest["design"]["frameVariants"] = [];
   for (const variant of FRAME_VARIANTS) {
     await copyFile(variantFramePath(variant), join(framesDir, `${variant}.png`));
+    frameVariants.push({ key: variant, device: VARIANT_DEVICE[variant] });
   }
   const custom = "variant" in cfg.frame ? null : "frames/custom.png";
   if (custom) await copyFile(framePath(cfg), join(webDir, custom));
+  const frames: StoreManifest["design"]["frames"] = {};
+  for (const device of cfg.devices) frames[device] = frameVariantFor(cfg, device);
+
+  // Bezel art a device brings itself, copied under its device key: the
+  // android Pixel art, which the frame picker does not apply to.
+  const deviceFrames: Record<string, { url: string; geom: FrameGeometry }> = {};
+  for (const key of cfg.devices) {
+    if (DEVICES[key].platform !== "android") continue;
+    const { image, geom } = deviceFrame(cfg, key);
+    const url = `frames/${key}${extname(image)}`;
+    await copyFile(image, join(webDir, url));
+    deviceFrames[key] = { url, geom };
+  }
 
   // Bundled typefaces, so the browser renders the same cuts the canvas does.
   const fontsDir = join(webDir, "fonts");
@@ -146,6 +190,27 @@ export async function writeManifest(cfg: LoadedConfig): Promise<string> {
       faces.push({ weight: Number(weight), url: `fonts/${file}` });
     }
     fonts.push({ key, family: font.family, fallback: font.fallback, faces });
+  }
+
+  // Typefaces the config brought with it, copied next to the bundled ones so the
+  // studio's preview and the exported PNGs use the same cuts. Without this the
+  // browser would fall back to a system face and the studio would disagree with
+  // the export for exactly the scripts theme.fontFiles exists to support.
+  for (const [i, font] of (cfg.theme.fontFiles ?? []).entries()) {
+    const faces: Array<{ weight: number; url: string }> = [];
+    for (const [weight, file] of Object.entries(font.files)) {
+      // A family is free text: it may hold a "/" or match a bundled file's
+      // name, and two may share a slug, hence the prefix and the index.
+      const name = `custom-${i}-${slug(font.family)}-${weight}${extname(file)}`;
+      await copyFile(file, join(fontsDir, name));
+      faces.push({ weight: Number(weight), url: `fonts/${name}` });
+    }
+    fonts.push({
+      key: font.family,
+      family: font.family,
+      fallback: CUSTOM_FONT_FALLBACK,
+      faces,
+    });
   }
 
   // Decoration images, copied so the browser can draw the same layers.
@@ -181,22 +246,33 @@ export async function writeManifest(cfg: LoadedConfig): Promise<string> {
   }
 
   const captures: StoreManifest["design"]["captures"] = {};
+  // Capture files sit under out/raw, which web/raw links to; a url keeps the
+  // file's path below it, so per-locale dirs come along.
+  const rawRoot = join(cfg.outDir, "raw");
+  const rawUrl = (file: string) => `raw/${relative(rawRoot, file).split(sep).join("/")}`;
+  const urlsOf = (raw: CaptureManifest): DeviceCaptureUrls => ({
+    screenshots: raw.screenshots.map((s) => ({ sceneId: s.sceneId, url: rawUrl(s.file) })),
+    clips: raw.preview
+      ? raw.preview.clips.map((c) => ({
+          segmentId: c.segmentId,
+          url: rawUrl(c.file),
+          durationSeconds: c.durationSeconds,
+        }))
+      : null,
+  });
   for (const deviceKey of cfg.devices) {
-    const raw = await readCaptureManifest(cfg, deviceKey);
-    if (!raw) continue;
-    captures[deviceKey] = {
-      screenshots: raw.screenshots.map((s) => ({
-        sceneId: s.sceneId,
-        url: `raw/${deviceKey}/${basename(s.file)}`,
-      })),
-      clips: raw.preview
-        ? raw.preview.clips.map((c) => ({
-            segmentId: c.segmentId,
-            url: `raw/${deviceKey}/${basename(c.file)}`,
-            durationSeconds: c.durationSeconds,
-          }))
-        : null,
-    };
+    if (!capturesPerLocale(cfg, deviceKey)) {
+      const raw = await readCaptureManifest(cfg, deviceKey, cfg.locales[0]!);
+      if (raw) captures[deviceKey] = urlsOf(raw);
+      continue;
+    }
+    const byLocale: Record<string, DeviceCaptureUrls> = {};
+    for (const locale of cfg.locales) {
+      const raw = await readCaptureManifest(cfg, deviceKey, locale);
+      if (raw) byLocale[locale] = urlsOf(raw);
+    }
+    const first = byLocale[cfg.locales[0]!] ?? Object.values(byLocale)[0];
+    if (first) captures[deviceKey] = { ...first, byLocale };
   }
 
   const previewScene = cfg.scenes.find(isPreview);
@@ -206,16 +282,20 @@ export async function writeManifest(cfg: LoadedConfig): Promise<string> {
     devices: cfg.devices.map((key) => ({
       key,
       label: DEVICES[key].label,
-      simulatorName: DEVICES[key].simulatorName,
+      platform: DEVICES[key].platform,
+      type: DEVICES[key].type,
+      copyScale: DEVICES[key].copyScale ?? 1,
+      simulatorName: DEVICES[key].simulatorName ?? null,
       screenshot: DEVICES[key].screenshot,
       preview: DEVICES[key].preview,
+      frame: deviceFrames[key] ?? null,
     })),
     locales: cfg.locales,
     assets,
     design: {
       theme: cfg.theme,
-      frameVariant: "variant" in cfg.frame ? cfg.frame.variant : null,
-      frameVariants: [...FRAME_VARIANTS],
+      frames,
+      frameVariants,
       customFrameUrl: custom,
       fonts,
       layouts: Object.values(LAYOUTS).map(({ key, label, description, span }) => ({
@@ -245,12 +325,24 @@ export async function writeManifest(cfg: LoadedConfig): Promise<string> {
   return file;
 }
 
+/** A font family as a safe file-name segment. */
+function slug(family: string): string {
+  return (
+    family
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "") || "font"
+  );
+}
+
 async function readCaptureManifest(
   cfg: LoadedConfig,
   deviceKey: DeviceKey,
+  locale: string,
 ): Promise<CaptureManifest | null> {
   try {
-    return JSON.parse(await readFile(join(cfg.outDir, "raw", deviceKey, "manifest.json"), "utf8"));
+    const dir = rawDirFor(cfg, deviceKey, locale);
+    return JSON.parse(await readFile(join(dir, "manifest.json"), "utf8"));
   } catch {
     return null;
   }
@@ -261,9 +353,8 @@ async function collect(
   deviceKey: DeviceKey,
   locale: string,
 ): Promise<LocaleAssets> {
-  const label = DEVICES[deviceKey].label;
-  const shotDir = join(cfg.outDir, "screenshots", label, locale);
-  const previewDir = join(cfg.outDir, "previews", label, locale);
+  const shotDir = join(cfg.outDir, "screenshots", deviceKey, locale);
+  const previewDir = join(cfg.outDir, "previews", deviceKey, locale);
   const sceneOrder = cfg.scenes.filter(isScreenshot).map((s) => s.id);
 
   const screenshots: LocaleAssets["screenshots"] = [];
@@ -274,7 +365,7 @@ async function collect(
     const sceneId = sceneOrder.find((id) => name.includes(id)) ?? basename(name, ".png");
     screenshots.push({
       sceneId,
-      url: `screenshots/${label}/${locale}/${name}`,
+      url: `screenshots/${deviceKey}/${locale}/${name}`,
       width,
       height,
       bytes: (await stat(file)).size,
@@ -289,7 +380,7 @@ async function collect(
     const probe = await videoInfo(file);
     preview = {
       sceneId: previewScene.id,
-      url: `previews/${label}/${locale}/${previewName}`,
+      url: `previews/${deviceKey}/${locale}/${previewName}`,
       ...probe,
       bytes: (await stat(file)).size,
     };
@@ -300,18 +391,24 @@ async function collect(
 
 const ls = async (dir: string) => readdir(dir).catch(() => [] as string[]);
 
-/** Relative symlink, replaced on every run so a moved out/ never goes stale. */
+/**
+ * Directory link, replaced on every run so a moved out/ never goes stale.
+ * A relative symlink on macOS and Linux. On Windows a directory symlink needs
+ * Developer Mode or a privilege most accounts lack, so an NTFS junction is
+ * used instead; junctions need an absolute target and no special rights.
+ */
 async function link(target: string, path: string): Promise<void> {
-  await rm(path, { recursive: true, force: true });
-  await symlink(relative(dirname(path), target), path, "dir");
-}
-
-async function imageSize(file: string) {
-  const r = await execOrThrow("sips", ["-g", "pixelWidth", "-g", "pixelHeight", file]);
-  return {
-    width: Number(r.stdout.match(/pixelWidth:\s*(\d+)/)?.[1]),
-    height: Number(r.stdout.match(/pixelHeight:\s*(\d+)/)?.[1]),
-  };
+  // Unlink an existing link by name; a recursive rm must never follow a
+  // junction into the real captures on a rerun.
+  const existing = await lstat(path).catch(() => null);
+  if (existing?.isSymbolicLink()) await unlink(path);
+  else if (existing) await rm(path, { recursive: true, force: true });
+  if (process.platform === "win32") {
+    await mkdir(target, { recursive: true }); // a junction to a missing dir is dangling
+    await symlink(resolve(target), path, "junction");
+  } else {
+    await symlink(relative(dirname(path), target), path, "dir");
+  }
 }
 
 async function videoInfo(file: string) {

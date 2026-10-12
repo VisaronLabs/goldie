@@ -8,7 +8,11 @@ export function exec(
   opts: { cwd?: string; quiet?: boolean } = {},
 ): Promise<ExecResult> {
   return new Promise((res) => {
-    const child = spawn(cmd, args, { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"] });
+    // Node refuses to spawn .cmd/.bat shims without a shell; with one, it does
+    // not quote arguments, so paths with spaces must be quoted here.
+    const shell = process.platform === "win32" && /\.(cmd|bat)$/i.test(cmd);
+    const argv = shell ? args.map(quoteForCmd) : args;
+    const child = spawn(cmd, argv, { cwd: opts.cwd, shell, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => {
@@ -25,6 +29,10 @@ export function exec(
   });
 }
 
+function quoteForCmd(arg: string): string {
+  return /[\s"&|<>^()]/.test(arg) ? `"${arg.replace(/"/g, '\\"')}"` : arg;
+}
+
 export async function execOrThrow(
   cmd: string,
   args: string[],
@@ -35,18 +43,4 @@ export async function execOrThrow(
     throw new Error(`${cmd} ${args.join(" ")} exited ${r.code}\n${r.stderr || r.stdout}`);
   }
   return r;
-}
-
-/** First JSON value in a stream that may be prefixed with human-readable log lines. */
-export function parseJsonTail<T = unknown>(out: string): T | null {
-  const start = out.search(/[[{]/);
-  if (start === -1) return null;
-  for (let end = out.length; end > start; end--) {
-    try {
-      return JSON.parse(out.slice(start, end)) as T;
-    } catch {
-      /* keep shrinking */
-    }
-  }
-  return null;
 }

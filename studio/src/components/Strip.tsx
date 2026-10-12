@@ -1,8 +1,9 @@
 import { ChevronLeft, ChevronRight, X } from "lucide-react";
-import { Reorder } from "motion/react";
+import { AnimatePresence, Reorder } from "motion/react";
 import type React from "react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
+import { FRAMES, type FrameGeometry } from "../../../src/frame";
 import {
   BADGE,
   type Composition,
@@ -27,27 +28,57 @@ import { CHECKERBOARD, layoutOptions, TRANSPARENT } from "./DesignPanel";
 import { Select } from "./Sidebar";
 import { Button } from "./ui/button";
 
-/** Tiles shown at once; the App Store product page shows this many before scrolling. */
+/**
+ * Tiles per strip page, and per grid row; the App Store product page shows
+ * this many before scrolling.
+ */
 const PAGE_SIZE = 5;
-/** Apple's cap on screenshots per device family. */
+/** Apple's cap on screenshots per device family. Extra tiles stay visible, dimmed. */
 const MAX_SCREENSHOTS = 10;
+const GAP = "1rem";
+
+/** Flex basis for a grid cell that occupies `span` screenshot slots in a PAGE_SIZE row. */
+const cellBasis = (span: number) =>
+  `calc((100% - ${PAGE_SIZE - 1} * ${GAP}) / ${PAGE_SIZE} * ${span} + ${span - 1} * ${GAP})`;
 
 /**
- * The five-up strip, composited in the browser: each screenshot tile is the
- * raw device capture inside the bezel art on the chosen background, laid out
- * with the exact geometry the CLI renders with (src/frame.ts), so what you see
- * is what an export renders. Background and frame arrive as props from React
- * state - changing them repaints instantly, no CLI involved. The preview tile
- * plays the raw clips as they are: Apple requires a plain screen recording.
+/**
+ * Page-turn animation: the incoming page slides in from the side the arrow
+ * points at while the outgoing page leaves through the opposite edge. 110%
+ * keeps a page's tile shadows clear of the clip edge until it is in motion.
+ */
+const pageSlide = {
+  enter: (direction: number) => ({ x: direction > 0 ? "110%" : "-110%" }),
+  center: { x: "0%" },
+  exit: (direction: number) => ({ x: direction > 0 ? "-110%" : "110%" }),
+};
+
+/** How the tiles are laid out: one paged row like the store's carousel, or a wrapping grid. */
+export type StripView = "strip" | "grid";
+
+/**
+ * The screenshot strip, composited in the browser: each tile is the raw device
+ * capture inside the bezel art on the chosen background, laid out with the
+ * exact geometry the CLI renders with (src/frame.ts), so what you see is what
+ * an export renders. Background and frame arrive as props from React state -
+ * changing them repaints instantly, no CLI involved. The preview tile plays
+ * the raw clips as they are: Apple requires a plain screen recording.
  *
- * The App Store allows up to ten screenshots; the strip shows five tiles at a
- * time, and when there are more, arrows page through them like the store's
- * own carousel. Scenes past the tenth are dropped with a note.
+ * Two views, picked in the sidebar. The strip shows five tiles at a time and,
+ * when there are more, arrows page through them like the store's own
+ * carousel. The grid wraps five to a row and the stage scrolls. Either way
+ * every scene with a capture is shown; tiles past Apple's ten-screenshot cap
+ * are dimmed so the limit is visible without hiding work.
+ *
+ * Tiles wrap in a five-up row and the stage scrolls when there are more.
+ * Every scene with a capture is shown; tiles past Apple's ten-screenshot
+ * cap are dimmed so the limit is visible without hiding work.
  *
  * Every tile is a size-container: the geometry is computed in the device's
  * spec pixels and expressed in cqw/cqh, so the tile is the composition scaled
  * down. Captions under the tiles show the spec size the export will produce;
- * the video's turns red when the clips sum outside Apple's 15-30s window.
+ * the video's turns red when the clips sum outside Apple's 15-30s window
+ * (iOS only; the android video goes to YouTube, which has no bounds).
  *
  * In the lightbox the headline and subhead are editable in place; a change
  * is reported through onCopy for the current locale and layered over the
@@ -75,6 +106,7 @@ export function Strip({
   screenOnly,
   sceneLayouts,
   onSceneLayout,
+  view,
 }: {
   design: Design;
   captures: DeviceCaptures;
@@ -95,8 +127,10 @@ export function Strip({
   screenOnly: boolean;
   sceneLayouts: Record<string, string>;
   onSceneLayout: (sceneId: string, key: string | undefined) => void;
+  view: StripView;
 }) {
   const theme = design.theme;
+  const frameGeometry = FRAMES[tileSpec.key as keyof typeof FRAMES] ?? FRAMES["iphone-6.9"];
   const scenes =
     order.length > 0
       ? [...design.scenes].sort((a, b) => rankOf(order, a.id) - rankOf(order, b.id))
@@ -126,23 +160,28 @@ export function Strip({
     unforced.find((r) => r.scene.id === scene.id)!.layout.key;
 
   // Mirrors the CLI's --background handling: a dark background flips the copy
-  // to light, and per-scene background overrides are dropped, so the export
-  // matches what is on screen.
-  const dark = isDarkBackground(background);
-  const headlineColor = dark ? "#FFFFFF" : theme.headlineColor;
-  const subheadColor = dark ? "#D9E1EA" : theme.subheadColor;
+  // to light, a light background flips light copy colors to dark, and
+  // per-scene background overrides are dropped, so the export matches what
+  // is on screen.
+  const bgLum = backgroundLuminance(background);
+  const dark = bgLum !== null && bgLum < 0.5;
+  const light = bgLum !== null && bgLum >= 0.5;
+  const lightColor = (c: string) => (backgroundLuminance(c) ?? 0) > 0.5;
+  const headlineColor = dark
+    ? "#FFFFFF"
+    : light && lightColor(theme.headlineColor)
+      ? "#0E1B2A"
+      : theme.headlineColor;
+  const subheadColor = dark
+    ? "#D9E1EA"
+    : light && lightColor(theme.subheadColor)
+      ? "#5A6A7D"
+      : theme.subheadColor;
 
-  const allShots = scenes.flatMap((scene) => {
+  const shots = scenes.flatMap((scene) => {
     const capture = captures.screenshots.find((s) => s.sceneId === scene.id);
     return capture ? [{ scene, capture }] : [];
   });
-  // Apple's cap counts tiles, so a panorama scene uses two of the ten.
-  let used = 0;
-  const shots = allShots.filter(({ scene }) => {
-    used += layoutOf(scene).layout.span;
-    return used <= MAX_SCREENSHOTS;
-  });
-  const dropped = allShots.length - shots.length;
 
   const segments =
     design.preview && captures.clips
@@ -153,6 +192,11 @@ export function Strip({
       : [];
 
   const totalSeconds = segments.reduce((s, c) => s + c.durationSeconds, 0);
+
+  // A device with its own bezel art (android) ignores the frame picker: the
+  // picker's variants are iPhone art, with iPhone geometry.
+  const deviceFrameUrl = tileSpec.frame?.url ?? frameUrl;
+  const geom = tileSpec.frame?.geom;
 
   type Entry = {
     key: string;
@@ -166,6 +210,8 @@ export function Strip({
     scene: (editable: boolean) => ReactNode;
     /** Set on screenshot tiles, which can be dragged into a new order. */
     sceneId?: string;
+    /** Past Apple's per-device screenshot cap; still shown, dimmed. */
+    overLimit?: boolean;
     /** The lightbox's per-scene layout override control (screenshots only). */
     layout?: {
       value: string | undefined;
@@ -175,17 +221,21 @@ export function Strip({
     };
   };
   const entries: Entry[] = [];
-  if (segments.length > 0) {
+  if (segments.length > 0 && tileSpec.preview) {
+    // The 15-30s window is Apple's upload rule; the android video goes to
+    // YouTube, which has no duration bounds.
+    const outOfBounds = tileSpec.platform === "ios" && (totalSeconds < 15 || totalSeconds > 30);
     entries.push({
       key: "preview",
       width: tileSpec.preview.width,
       height: tileSpec.preview.height,
-      bad: totalSeconds < 15 || totalSeconds > 30,
+      bad: outOfBounds,
       badReason: "Clips sum outside the 15-30s Apple allows for previews.",
       editable: false,
       scene: () => <PreviewScene segments={segments} />,
     });
   }
+  let shotCount = 0;
   for (const { scene, capture } of shots) {
     const { layout: spec, secondScene } = layoutOf(scene);
     const second = secondScene
@@ -197,11 +247,13 @@ export function Strip({
       onChange: (key: string | undefined) => onSceneLayout(scene.id, key),
     };
     for (let slice = 0; slice < spec.span; slice++) {
+      shotCount += 1;
       entries.push({
         key: spec.span > 1 ? `${scene.id}#${slice + 1}` : scene.id,
         width: tileSpec.screenshot.width,
         height: tileSpec.screenshot.height,
         bad: false,
+        overLimit: shotCount > MAX_SCREENSHOTS,
         editable: true,
         // Only the first slice drags; the second follows it.
         sceneId: slice === 0 ? scene.id : undefined,
@@ -211,10 +263,13 @@ export function Strip({
             spec={spec}
             slice={slice}
             tile={tileSpec.screenshot}
+            frame={frameGeometry}
             theme={theme}
             screenOnly={screenOnly}
             background={background}
-            frameUrl={frameUrl}
+            frameUrl={deviceFrameUrl}
+            geom={geom}
+            copyScale={tileSpec.copyScale}
             fontFamily={fontFamily}
             headline={copy[scene.id]?.headline?.[locale] ?? scene.headline[locale] ?? ""}
             subhead={copy[scene.id]?.subhead?.[locale] ?? scene.subhead?.[locale]}
@@ -265,6 +320,7 @@ export function Strip({
         height={entry.height}
         bad={entry.bad}
         badReason={entry.badReason}
+        overLimit={entry.overLimit}
         onOpen={() => {
           if (!dragged.current) setOpen(i);
         }}
@@ -277,8 +333,8 @@ export function Strip({
     );
   };
 
-  // Strip cells: the preview tile, then one cell per scene holding its
-  // tile(s), so a panorama's two slices drag together. Cells are paged so a
+  // Cells: the preview tile, then one cell per scene holding its tile(s),
+  // so a panorama's two slices drag together. Cells are paged so a strip
   // page holds at most PAGE_SIZE tiles without splitting a scene.
   type Cell = { sceneId?: string; tiles: number[] };
   const cells: Cell[] = [];
@@ -299,6 +355,13 @@ export function Strip({
   }
   const pages = pageCells.length;
   const [page, setPage] = useState(0);
+  // Which way the last page turn went, so the incoming page slides in from
+  // that side and the outgoing one leaves through the other.
+  const [direction, setDirection] = useState(0);
+  const turnPage = (delta: number) => {
+    setDirection(delta);
+    setPage((p) => p + delta);
+  };
   // A device switch can shrink the tile count; keep the page in range.
   useEffect(() => {
     if (page > pages - 1) setPage(pages - 1);
@@ -312,37 +375,40 @@ export function Strip({
 
   if (entries.length === 0) return null;
 
+  const pastLimit = entries.filter((e) => e.overLimit).length;
+  // Scenes without a capture stay in place; captured ones take the new
+  // order: the whole grid's, or the current page's spliced back into it.
+  const reorderWithin = (ids: string[]) => (next: string[]) => {
+    const queue = [...next];
+    onReorder(scenes.map((s) => (ids.includes(s.id) ? queue.shift()! : s.id)));
+  };
+  const sceneIds = cells.flatMap((c) => (c.sceneId ? [c.sceneId] : []));
+  const reorderAll = reorderWithin(sceneIds);
   const visible = pageCells[Math.min(page, pages - 1)];
   const visibleIds = visible.flatMap((c) => (c.sceneId ? [c.sceneId] : []));
+  const reorderPage = reorderWithin(visibleIds);
   // Pad the last page so tiles keep the same width as on a full page.
   const columns = pages > 1 ? PAGE_SIZE : entries.length;
-  // The page's scenes in their new order, spliced back into the full order.
-  const reorderPage = (ids: string[]) => {
-    const queue = [...ids];
-    onReorder(scenes.map((s) => (visibleIds.includes(s.id) ? queue.shift()! : s.id)));
-  };
 
   return (
     <div className="flex w-full flex-col gap-3">
-      <div className="relative">
+      {view === "grid" ? (
         <Reorder.Group
-          axis="x"
-          values={visibleIds}
-          onReorder={reorderPage}
+          axis="xy"
+          values={sceneIds}
+          onReorder={reorderAll}
           aria-label="Screenshots, drag to reorder"
-          className="grid w-full list-none items-start gap-4 p-0"
-          style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+          className="flex w-full list-none flex-wrap items-start gap-4 p-0"
         >
-          {visible.map((cell) =>
+          {cells.map((cell) =>
             cell.sceneId ? (
               <Reorder.Item
                 key={cell.sceneId}
                 value={cell.sceneId}
-                className="relative grid gap-4"
+                className="relative flex min-w-0 gap-4"
                 style={{
                   zIndex: lifting === cell.sceneId ? 10 : undefined,
-                  gridColumn: `span ${cell.tiles.length}`,
-                  gridTemplateColumns: `repeat(${cell.tiles.length}, minmax(0, 1fr))`,
+                  flex: `0 0 ${cellBasis(cell.tiles.length)}`,
                 }}
                 animate={{ scale: lifting === cell.sceneId ? 1.04 : 1 }}
                 onDragStart={() => {
@@ -359,33 +425,93 @@ export function Strip({
                 {cell.tiles.map(tileAt)}
               </Reorder.Item>
             ) : (
-              <li key={entries[cell.tiles[0]].key}>{tileAt(cell.tiles[0])}</li>
+              <li
+                key={entries[cell.tiles[0]].key}
+                className="min-w-0"
+                style={{ flex: `0 0 ${cellBasis(1)}` }}
+              >
+                {tileAt(cell.tiles[0])}
+              </li>
             ),
           )}
         </Reorder.Group>
+      ) : (
+        <div className="relative">
+          {/* Clips only horizontally, so a sliding page vanishes at the strip's
+              edge while tile shadows and the hover lift stay visible; the small
+              padding keeps the edge tiles' own shadows out of the clip. */}
+          <div className="-mx-2 overflow-x-clip px-2">
+            <AnimatePresence mode="popLayout" initial={false} custom={direction}>
+              <Reorder.Group
+                key={page}
+                axis="x"
+                values={visibleIds}
+                onReorder={reorderPage}
+                aria-label="Screenshots, drag to reorder"
+                className="grid w-full list-none items-start gap-4 p-0"
+                style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+                custom={direction}
+                variants={pageSlide}
+                initial="enter"
+                animate="center"
+                exit="exit"
+                transition={{ type: "tween", duration: 0.25, ease: "easeInOut" }}
+              >
+                {visible.map((cell) =>
+                  cell.sceneId ? (
+                    <Reorder.Item
+                      key={cell.sceneId}
+                      value={cell.sceneId}
+                      className="relative grid gap-4"
+                      style={{
+                        zIndex: lifting === cell.sceneId ? 10 : undefined,
+                        gridColumn: `span ${cell.tiles.length}`,
+                        gridTemplateColumns: `repeat(${cell.tiles.length}, minmax(0, 1fr))`,
+                      }}
+                      animate={{ scale: lifting === cell.sceneId ? 1.04 : 1 }}
+                      onDragStart={() => {
+                        dragged.current = true;
+                        setLifting(cell.sceneId ?? null);
+                      }}
+                      onDragEnd={() => {
+                        setLifting(null);
+                        setTimeout(() => {
+                          dragged.current = false;
+                        }, 0);
+                      }}
+                    >
+                      {cell.tiles.map(tileAt)}
+                    </Reorder.Item>
+                  ) : (
+                    <li key={entries[cell.tiles[0]].key}>{tileAt(cell.tiles[0])}</li>
+                  ),
+                )}
+              </Reorder.Group>
+            </AnimatePresence>
+          </div>
 
-        {pages > 1 ? (
-          <>
-            <PagerButton
-              side="left"
-              label="Previous screenshots"
-              disabled={page === 0}
-              onClick={() => setPage((p) => p - 1)}
-            />
-            <PagerButton
-              side="right"
-              label="Next screenshots"
-              disabled={page === pages - 1}
-              onClick={() => setPage((p) => p + 1)}
-            />
-          </>
-        ) : null}
-      </div>
+          {pages > 1 ? (
+            <>
+              <PagerButton
+                side="left"
+                label="Previous screenshots"
+                disabled={page === 0}
+                onClick={() => turnPage(-1)}
+              />
+              <PagerButton
+                side="right"
+                label="Next screenshots"
+                disabled={page === pages - 1}
+                onClick={() => turnPage(1)}
+              />
+            </>
+          ) : null}
+        </div>
+      )}
 
-      {dropped > 0 ? (
+      {pastLimit > 0 ? (
         <p className="text-center text-[11px] font-medium text-destructive">
-          {dropped} more scene{dropped === 1 ? "" : "s"} hidden: the App Store allows{" "}
-          {MAX_SCREENSHOTS} screenshots.
+          The App Store allows {MAX_SCREENSHOTS} screenshots; {pastLimit} sit past that limit.
         </p>
       ) : null}
 
@@ -470,9 +596,12 @@ function Lightbox({
         style={{
           viewTransitionName: "lightbox-scene",
           aspectRatio: `${entry.width} / ${entry.height}`,
-          maxWidth: "calc(100vw - 4rem)",
-          maxHeight: "calc(100vh - 6rem)",
-          width: `calc((100vh - 6rem) * ${entry.width / entry.height})`,
+          // Sized by width alone so the aspect ratio always holds: a height
+          // cap plus flex shrinking would squash the box, stretching the bezel
+          // art off the cover-fitted capture (a misaligned camera cutout). The
+          // 7.5rem clears the padding, gap and layout row below the scene.
+          flexShrink: 0,
+          width: `min(calc(100vw - 4rem), calc((100vh - 7.5rem) * ${entry.width / entry.height}))`,
         }}
       >
         {entry.scene(true)}
@@ -527,7 +656,7 @@ function Lightbox({
   );
 }
 
-/** Round arrow floating over the strip's edge, like the store carousel's. */
+/** Round arrow floating over the lightbox's edge. */
 function PagerButton({
   side,
   label,
@@ -605,10 +734,13 @@ function ScreenshotScene({
   spec,
   slice,
   tile,
+  frame,
   theme,
   screenOnly,
   background,
   frameUrl,
+  geom,
+  copyScale,
   fontFamily,
   headline,
   subhead,
@@ -624,10 +756,14 @@ function ScreenshotScene({
   spec: (typeof LAYOUTS)[keyof typeof LAYOUTS];
   slice: number;
   tile: { width: number; height: number };
+  frame: FrameGeometry;
   theme: Theme;
   screenOnly: boolean;
   background: string;
   frameUrl: string;
+  /** The bezel art's geometry; the iOS bundled art's when the device brings none. */
+  geom: FrameGeometry | undefined;
+  copyScale: number;
   fontFamily: string;
   headline: string;
   subhead: string | undefined;
@@ -640,8 +776,11 @@ function ScreenshotScene({
   locale: string;
   onEdit?: (field: "headline" | "subhead", text: string) => void;
 }) {
-  const c = compose(spec, tile, theme, { screenOnly });
+  const c = compose(spec, tile, theme, { screenOnly, geom: geom ?? frame, copyScale });
   const { w, h } = cq(tile);
+  // Wider-than-reference tiles compose at a narrower design width; type
+  // follows it, times the device's copy scale.
+  const typeScale = (c.copy?.typeWidth ?? c.designWidth) / tile.width;
   const editable = onEdit ? editableProps : () => ({});
   const copy = c.copy;
   return (
@@ -682,10 +821,10 @@ function ScreenshotScene({
               style={{
                 margin: 0,
                 color: headlineColor,
-                fontSize: `${TYPE.headlineSize * 100}cqw`,
+                fontSize: `${TYPE.headlineSize * typeScale * 100}cqw`,
                 lineHeight: TYPE.headlineLineHeight,
                 fontWeight: TYPE.headlineWeight,
-                letterSpacing: `${TYPE.headlineTracking * 100}cqw`,
+                letterSpacing: `${TYPE.headlineTracking * typeScale * 100}cqw`,
               }}
               {...editable((text) => onEdit?.("headline", text), headline, "Headline")}
             >
@@ -696,7 +835,7 @@ function ScreenshotScene({
                 style={{
                   margin: 0,
                   color: subheadColor,
-                  fontSize: `${TYPE.subheadSize * 100}cqw`,
+                  fontSize: `${TYPE.subheadSize * typeScale * 100}cqw`,
                   lineHeight: TYPE.subheadLineHeight,
                   fontWeight: TYPE.subheadWeight,
                   minWidth: "30cqw",
@@ -928,6 +1067,7 @@ function Tile({
   height,
   bad,
   badReason,
+  overLimit,
   onOpen,
   transitionName,
   draggable,
@@ -937,17 +1077,22 @@ function Tile({
   height: number;
   bad: boolean;
   badReason?: string;
+  overLimit?: boolean;
   onOpen: () => void;
   transitionName?: string;
   draggable: boolean;
   children: ReactNode;
 }) {
   return (
-    <div>
+    <div className={`min-w-0 flex-1 ${overLimit ? "opacity-40" : ""}`}>
       <button
         type="button"
         aria-label={
-          draggable ? "Open full-size preview (drag to reorder)" : "Open full-size preview"
+          overLimit
+            ? "Open full-size preview (past the App Store screenshot limit)"
+            : draggable
+              ? "Open full-size preview (drag to reorder)"
+              : "Open full-size preview"
         }
         title={draggable ? "Drag to reorder" : undefined}
         onClick={onOpen}
@@ -972,12 +1117,12 @@ function rankOf(order: string[], id: string): number {
 }
 
 /**
- * Mirror of the CLI's isDarkBackground: mean relative luminance of the
- * background's hex stops, below 0.5 counts as dark.
+ * Mirror of the CLI's backgroundLuminance: mean relative luminance of the
+ * value's six-digit hex colors, or null when it has none.
  */
-function isDarkBackground(css: string): boolean {
+function backgroundLuminance(css: string): number | null {
   const hexes = css.match(/#[0-9a-fA-F]{6}/g);
-  if (!hexes || hexes.length === 0) return false;
+  if (!hexes || hexes.length === 0) return null;
   const luminance = (hex: string) => {
     const channel = (offset: number) => {
       const c = parseInt(hex.slice(offset, offset + 2), 16) / 255;
@@ -985,5 +1130,5 @@ function isDarkBackground(css: string): boolean {
     };
     return 0.2126 * channel(1) + 0.7152 * channel(3) + 0.0722 * channel(5);
   };
-  return hexes.reduce((sum, hex) => sum + luminance(hex), 0) / hexes.length < 0.5;
+  return hexes.reduce((sum, hex) => sum + luminance(hex), 0) / hexes.length;
 }
